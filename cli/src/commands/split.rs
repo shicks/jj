@@ -400,13 +400,21 @@ pub(crate) async fn cmd_split(
     let second_desc = second_commit.description();
 
     let winner = if first_desc == original_description && second_desc != original_description {
-        0 // First commit wins
+        // First commit wins
+        if let Some(mut formatter) = ui.status_formatter() {
+            writeln!(formatter, "Associating original change with first commit")?;
+        }
+        0
     } else if second_desc == original_description && first_desc != original_description {
-        1 // Second commit wins
+        // Second commit wins
+        if let Some(mut formatter) = ui.status_formatter() {
+            writeln!(formatter, "Associating original change with second commit")?;
+        }
+        1
     } else if ui.can_prompt() {
-        let choices = &["1", "2", "N"];
+        let choices = &["First commit", "Second commit", "Neither commit"];
         let choice = ui.prompt_choice(
-            "Choose which commit to associate with the change (1, 2, N)",
+            "Choose which commit to associate with the change",
             choices,
             Some(0), // Default to first commit to preserve old behavior
         )?;
@@ -420,72 +428,47 @@ pub(crate) async fn cmd_split(
         0 // Fallback to old behavior (first commit wins)
     };
 
-    let (first_commit, second_commit) = match winner {
-        0 => (first_commit, second_commit), // First commit kept ID, nothing to do.
-        1 => {
-            // Second commit wins. We need to swap.
-            // Rewrite both commits.
-            
-            // Abandon the old commits to avoid divergence
-            tx.repo_mut().record_abandoned_commit_with_parents(first_commit.id().clone(), first_commit.parent_ids().to_vec());
-            tx.repo_mut().record_abandoned_commit_with_parents(second_commit.id().clone(), second_commit.parent_ids().to_vec());
+    let (first_commit, second_commit) = if winner == 0 {
+        (first_commit, second_commit)
+    } else {
+        // The first commit has the wrong ID. We need to rewrite both commits,
+        // regardless of whether the second commit gets the original ID.
 
-            // first_commit gets a new ID.
-            let mut first_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-            first_builder.set_tree(first_commit.tree().clone());
-            first_builder.set_description(first_commit.description().to_owned());
-            first_builder.clear_rewrite_source();
-            first_builder.generate_new_change_id();
-            let new_first_commit = first_builder.write(tx.repo_mut()).await?;
+        // Abandon the old commits to avoid divergence (we won't need them).
+        tx.repo_mut().record_abandoned_commit_with_parents(first_commit.id().clone(), first_commit.parent_ids().to_vec());
+        tx.repo_mut().record_abandoned_commit_with_parents(second_commit.id().clone(), second_commit.parent_ids().to_vec());
 
-            // second_commit keeps original ID.
-            // We need to update its parent to be the new first commit if not parallel!
-            let parents = if parallel {
-                second_commit.parent_ids().to_vec()
-            } else {
-                vec![new_first_commit.id().clone()]
-            };
-            let mut second_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-            second_builder.set_parents(parents).set_tree(second_commit.tree().clone());
-            second_builder.set_description(second_commit.description().to_owned());
-            // It keeps the original rewrite source (target.commit) by default in rewrite_commit.
-            let new_second_commit = second_builder.write(tx.repo_mut()).await?;
+        // first_commit gets a brand new ID in all cases.
+        let mut first_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+        first_builder.set_tree(first_commit.tree().clone());
+        first_builder.set_description(first_commit.description().to_owned());
+        first_builder.clear_rewrite_source();
+        first_builder.generate_new_change_id();
+        // Overwrite first_commit
+        let new_first_commit = first_builder.write(tx.repo_mut()).await?;
+        
+        // second_commit either keeps the original ID or gets a new one.
+        // Either way, ensure we have the right parent its parent to be the new
+        // first commit if not parallel!
+        let parents = if parallel {
+            second_commit.parent_ids().to_vec()
+        } else {
+            vec![new_first_commit.id().clone()]
+        };
 
-            (new_first_commit, new_second_commit)
-        }
-        2 => {
-            // Neither wins, both get new IDs.
-            
-            // Abandon the old commits to avoid divergence
-            tx.repo_mut().record_abandoned_commit_with_parents(first_commit.id().clone(), first_commit.parent_ids().to_vec());
-            tx.repo_mut().record_abandoned_commit_with_parents(second_commit.id().clone(), second_commit.parent_ids().to_vec());
+        let mut second_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+        second_builder.set_parents(parents).set_tree(second_commit.tree().clone());
+        second_builder.set_description(second_commit.description().to_owned());
 
-            // first_commit gets a new ID.
-            let mut first_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-            first_builder.set_tree(first_commit.tree().clone());
-            first_builder.set_description(first_commit.description().to_owned());
-            first_builder.clear_rewrite_source();
-            first_builder.generate_new_change_id();
-            let new_first_commit = first_builder.write(tx.repo_mut()).await?;
-
-            // second_commit already has a new ID in old code by default!
-            // But we need to update its parent if not parallel!
-            let parents = if parallel {
-                second_commit.parent_ids().to_vec()
-            } else {
-                vec![new_first_commit.id().clone()]
-            };
-            let mut second_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-            second_builder.set_parents(parents).set_tree(second_commit.tree().clone());
-            second_builder.set_description(second_commit.description().to_owned());
+        if winner == 2 {
+            // Note: if we skip this (i.e. winner == 1), then the change id just
+            // comes from target.commit, which is what we want in that case.
             second_builder.clear_rewrite_source();
             second_builder.generate_new_change_id();
-            let new_second_commit = second_builder.write(tx.repo_mut()).await?;
-
-            (new_first_commit, new_second_commit)
         }
-        _ => unreachable!(),
-    };
+        let new_second_commit = second_builder.write(tx.repo_mut()).await?;
+
+        (new_first_commit, new_second_commit)
 
     let (first_commit, second_commit, num_rebased) = if use_move_flags {
         move_first_commit(
@@ -501,20 +484,23 @@ pub(crate) async fn cmd_split(
         rewrite_descendants(&mut tx, &target, first_commit, second_commit, parallel, winner).await?
     };
 
-    // Manually move bookmarks pointing to the original commit to the winner commit,
-    // to ensure they follow the Change ID even if rewrite_descendants moved them differently.
-    let winner_commit = if winner == 0 { &first_commit } else { &second_commit };
-    let mut bookmarks_to_move = Vec::new();
-    for (bookmark, local_target) in tx.repo().view().local_bookmarks() {
-        if local_target.added_ids().any(|id| id == target.commit.id()) {
-            bookmarks_to_move.push(bookmark.to_owned());
+    // Manually move bookmarks pointing to the original commit to the winner
+    // commit, to ensure they follow the Change ID even if rewrite_descendants
+    // moved them differently.
+    if winner != 2 {
+        let winner_commit = if winner == 0 { &first_commit } else { &second_commit };
+        let mut bookmarks_to_move = Vec::new();
+        for (bookmark, local_target) in tx.repo().view().local_bookmarks() {
+            if local_target.added_ids().any(|id| id == target.commit.id()) {
+                bookmarks_to_move.push(bookmark.to_owned());
+            }
         }
-    }
-    for bookmark in bookmarks_to_move {
-        tx.repo_mut().set_local_bookmark_target(
-            &bookmark,
-            jj_lib::op_store::RefTarget::normal(winner_commit.id().clone()),
-        );
+        for bookmark in bookmarks_to_move {
+            tx.repo_mut().set_local_bookmark_target(
+                &bookmark,
+                jj_lib::op_store::RefTarget::normal(winner_commit.id().clone()),
+            );
+        }
     }
 
     if let Some(mut formatter) = ui.status_formatter() {
